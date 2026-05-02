@@ -11,32 +11,39 @@ const PORT = 3000;
 app.use(express.json());
 app.use(express.static('dist'));
 
-// Path to replies file
+// Path to replies file (for local/development)
 const repliesFile = path.join(__dirname, 'replies.json');
 
-// Ensure replies.json exists
+// Check if running on Vercel
+const isVercel = !!process.env.VERCEL;
+let kv = null;
+
+// Initialize Vercel KV if available
+if (isVercel) {
+  try {
+    const { kv: vercelKv } = await import('@vercel/kv');
+    kv = vercelKv;
+  } catch (err) {
+    console.warn('⚠️  Vercel KV not configured. Using memory storage (data will not persist).');
+  }
+}
+
+// Ensure replies.json exists (local development only)
 function ensureRepliesFile() {
-  if (!fs.existsSync(repliesFile)) {
+  if (!isVercel && !fs.existsSync(repliesFile)) {
     fs.writeFileSync(repliesFile, JSON.stringify([], null, 2));
   }
 }
 
 // POST: Submit a reply
-app.post('/submit-reply', (req, res) => {
+app.post('/submit-reply', async (req, res) => {
   try {
-    ensureRepliesFile();
-    
     const { name, message } = req.body;
     
     if (!message || !name) {
       return res.status(400).json({ error: 'Name and message are required' });
     }
 
-    // Read existing replies
-    const data = fs.readFileSync(repliesFile, 'utf8');
-    const replies = JSON.parse(data);
-
-    // Create new reply object
     const newReply = {
       id: Date.now(),
       name: name.trim(),
@@ -45,11 +52,33 @@ app.post('/submit-reply', (req, res) => {
       timestamp: Date.now()
     };
 
-    // Add to array
-    replies.push(newReply);
-
-    // Save back to file
-    fs.writeFileSync(repliesFile, JSON.stringify(replies, null, 2));
+    if (isVercel && kv) {
+      // Use Vercel KV for storage
+      try {
+        // Get existing replies
+        let replies = [];
+        const data = await kv.get('replies');
+        if (data) {
+          replies = typeof data === 'string' ? JSON.parse(data) : data;
+        }
+        
+        // Add new reply
+        replies.push(newReply);
+        
+        // Save back to KV
+        await kv.set('replies', JSON.stringify(replies));
+      } catch (kvError) {
+        console.error('KV Error:', kvError);
+        return res.status(500).json({ error: 'Failed to save reply (KV error)' });
+      }
+    } else {
+      // Use local file storage for development
+      ensureRepliesFile();
+      const data = fs.readFileSync(repliesFile, 'utf8');
+      const replies = JSON.parse(data);
+      replies.push(newReply);
+      fs.writeFileSync(repliesFile, JSON.stringify(replies, null, 2));
+    }
 
     res.status(200).json({ 
       success: true, 
@@ -63,12 +92,27 @@ app.post('/submit-reply', (req, res) => {
 });
 
 // GET: Retrieve all replies
-app.get('/get-replies', (req, res) => {
+app.get('/get-replies', async (req, res) => {
   try {
-    ensureRepliesFile();
-    
-    const data = fs.readFileSync(repliesFile, 'utf8');
-    const replies = JSON.parse(data);
+    let replies = [];
+
+    if (isVercel && kv) {
+      // Get from Vercel KV
+      try {
+        const data = await kv.get('replies');
+        if (data) {
+          replies = typeof data === 'string' ? JSON.parse(data) : data;
+        }
+      } catch (kvError) {
+        console.error('KV Error:', kvError);
+        return res.status(500).json({ error: 'Failed to read replies (KV error)', replies: [] });
+      }
+    } else {
+      // Get from local file
+      ensureRepliesFile();
+      const data = fs.readFileSync(repliesFile, 'utf8');
+      replies = JSON.parse(data);
+    }
 
     // Sort by most recent first
     replies.sort((a, b) => b.timestamp - a.timestamp);
