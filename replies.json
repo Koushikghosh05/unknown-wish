@@ -26,5 +26,12 @@
     "message": "Testing the updated server with KV support",
     "date": "2026-05-02T16:22:24.889Z",
     "timestamp": 1777738944889
+  },
+  {
+    "id": 1777739570324,
+    "name": "Fallback Test",
+    "message": "Testing improved error handling with fallback storage",
+    "date": "2026-05-02T16:32:50.324Z",
+    "timestamp": 1777739570324
   }
 ]
