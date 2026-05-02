@@ -1,0 +1,6 @@
+Add these two files next to this file (so the site can load them as /countdown.mp3 and /birthday_song.mp3):
+
+  countdown.mp3
+  birthday_song.mp3
+
+If they are missing, the browser will not play audio (404).
