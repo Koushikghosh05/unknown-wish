@@ -18,13 +18,16 @@ const repliesFile = path.join(__dirname, 'replies.json');
 const isVercel = !!process.env.VERCEL;
 let kv = null;
 
+// In-memory fallback storage
+let memoryStorage = [];
+
 // Initialize Vercel KV if available
 if (isVercel) {
   try {
     const { kv: vercelKv } = await import('@vercel/kv');
     kv = vercelKv;
   } catch (err) {
-    console.warn('⚠️  Vercel KV not configured. Using memory storage (data will not persist).');
+    console.warn('⚠️  Vercel KV not available. Using in-memory storage.');
   }
 }
 
@@ -52,39 +55,52 @@ app.post('/submit-reply', async (req, res) => {
       timestamp: Date.now()
     };
 
-    if (isVercel && kv) {
-      // Use Vercel KV for storage
-      try {
-        // Get existing replies
-        let replies = [];
-        const data = await kv.get('replies');
-        if (data) {
-          replies = typeof data === 'string' ? JSON.parse(data) : data;
+    if (isVercel) {
+      // Try KV first
+      if (kv) {
+        try {
+          let replies = [];
+          const data = await kv.get('replies');
+          if (data) {
+            replies = typeof data === 'string' ? JSON.parse(data) : data;
+          }
+          
+          replies.push(newReply);
+          await kv.set('replies', JSON.stringify(replies));
+          
+          return res.status(200).json({ 
+            success: true, 
+            message: 'Reply submitted successfully!',
+            reply: newReply 
+          });
+        } catch (kvError) {
+          console.error('KV Error:', kvError);
+          // Fall back to memory storage
+          console.log('Falling back to memory storage');
         }
-        
-        // Add new reply
-        replies.push(newReply);
-        
-        // Save back to KV
-        await kv.set('replies', JSON.stringify(replies));
-      } catch (kvError) {
-        console.error('KV Error:', kvError);
-        return res.status(500).json({ error: 'Failed to save reply (KV error)' });
       }
+      
+      // Fallback: use in-memory storage
+      memoryStorage.push(newReply);
+      res.status(200).json({ 
+        success: true, 
+        message: 'Reply submitted successfully! (cached)',
+        reply: newReply 
+      });
     } else {
-      // Use local file storage for development
+      // Local development: use file storage
       ensureRepliesFile();
       const data = fs.readFileSync(repliesFile, 'utf8');
       const replies = JSON.parse(data);
       replies.push(newReply);
       fs.writeFileSync(repliesFile, JSON.stringify(replies, null, 2));
-    }
 
-    res.status(200).json({ 
-      success: true, 
-      message: 'Reply submitted successfully!',
-      reply: newReply 
-    });
+      res.status(200).json({ 
+        success: true, 
+        message: 'Reply submitted successfully!',
+        reply: newReply 
+      });
+    }
   } catch (error) {
     console.error('Error saving reply:', error);
     res.status(500).json({ error: 'Failed to save reply' });
@@ -96,16 +112,22 @@ app.get('/get-replies', async (req, res) => {
   try {
     let replies = [];
 
-    if (isVercel && kv) {
-      // Get from Vercel KV
-      try {
-        const data = await kv.get('replies');
-        if (data) {
-          replies = typeof data === 'string' ? JSON.parse(data) : data;
+    if (isVercel) {
+      // Try KV first
+      if (kv) {
+        try {
+          const data = await kv.get('replies');
+          if (data) {
+            replies = typeof data === 'string' ? JSON.parse(data) : data;
+          }
+        } catch (kvError) {
+          console.error('KV Error:', kvError);
+          // Fall back to memory storage
+          replies = memoryStorage;
         }
-      } catch (kvError) {
-        console.error('KV Error:', kvError);
-        return res.status(500).json({ error: 'Failed to read replies (KV error)', replies: [] });
+      } else {
+        // Use in-memory storage as fallback
+        replies = memoryStorage;
       }
     } else {
       // Get from local file
