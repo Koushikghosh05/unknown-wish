@@ -314,6 +314,8 @@
 
     <div class="controls">
       <button class="btn-primary" onclick="loadReplies()">🔄 Refresh</button>
+      <button class="btn-secondary" onclick="manualSync()">🔗 Sync Data</button>
+      <button class="btn-secondary" onclick="checkStatus()">📊 Storage Status</button>
       <button class="btn-secondary" onclick="goBack()">← Back</button>
     </div>
 
@@ -395,6 +397,41 @@
       }
     }
 
+    async function manualSync() {
+      const originalText = event.target.textContent;
+      event.target.textContent = '⏳ Syncing...';
+      event.target.disabled = true;
+
+      try {
+        const response = await fetch('/admin-sync', { method: 'POST' });
+        const data = await response.json();
+        
+        alert(`✅ Sync Complete!\n\nKV Messages: ${data.kvCount}\nFile Messages: ${data.fileCount}\nTotal Merged: ${data.mergedCount}`);
+        loadReplies(); // Reload after sync
+      } catch (error) {
+        alert(`❌ Sync Failed: ${error.message}`);
+      } finally {
+        event.target.textContent = originalText;
+        event.target.disabled = false;
+      }
+    }
+
+    async function checkStatus() {
+      try {
+        const response = await fetch('/admin-status');
+        const status = await response.json();
+        
+        alert(`📊 Storage Status:\n\n` +
+          `KV Database: ${status.kvMessages} messages\n` +
+          `File Storage: ${status.fileMessages} messages\n` +
+          `Total Unique: ${status.totalUnique} messages\n\n` +
+          `KV Available: ${status.kvAvailable ? '✅' : '❌'}\n` +
+          `File Available: ${status.fileAvailable ? '✅' : '❌'}`);
+      } catch (error) {
+        alert(`❌ Failed to check status: ${error.message}`);
+      }
+    }
+
     function createReplyCard(reply, index) {
       const card = document.createElement('div');
       card.className = 'reply-card';
@@ -449,6 +486,16 @@
 
     // Auto-refresh every 10 seconds
     setInterval(loadReplies, 10000);
+
+    // Auto-sync data every 5 minutes to prevent loss
+    setInterval(async () => {
+      try {
+        await fetch('/admin-sync', { method: 'POST' });
+        console.log('✅ Background sync completed');
+      } catch (err) {
+        console.warn('⚠️ Background sync failed:', err);
+      }
+    }, 5 * 60 * 1000);
   </script>
 </body>
 </html>
