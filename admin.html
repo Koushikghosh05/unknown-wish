@@ -314,9 +314,14 @@
 
     <div class="controls">
       <button class="btn-primary" onclick="loadReplies()">🔄 Refresh</button>
-      <button class="btn-secondary" onclick="manualSync()">🔗 Sync Data</button>
+      <button class="btn-secondary" onclick="manualSync()">� Sync to Redis</button>
       <button class="btn-secondary" onclick="checkStatus()">📊 Storage Status</button>
+      <button class="btn-secondary" onclick="checkRedis()">🔗 Redis Status</button>
       <button class="btn-secondary" onclick="goBack()">← Back</button>
+    </div>
+    
+    <div id="redisStatus" style="text-align: center; margin-bottom: 20px; padding: 10px; border-radius: 8px; background: rgba(255, 255, 255, 0.1); color: white; display: none;">
+      <span id="redisStatusText">Checking Redis...</span>
     </div>
 
     <div class="stats">
@@ -397,6 +402,38 @@
       }
     }
 
+    async function checkRedis() {
+      const statusDiv = document.getElementById('redisStatus');
+      const statusText = document.getElementById('redisStatusText');
+      statusDiv.style.display = 'block';
+      statusText.textContent = '⏳ Checking Redis connection...';
+
+      try {
+        const response = await fetch('/check-redis');
+        const data = await response.json();
+        
+        if (data.connected) {
+          statusDiv.style.backgroundColor = 'rgba(76, 175, 80, 0.3)';
+          statusText.textContent = '✅ Redis is connected and healthy!';
+          alert('✅ Redis Connection Status:\n\nConnected: YES\n' + 
+            'Status: Healthy\n\n' + 
+            'Your messages will persist in Redis permanently (no expiration).');
+        } else {
+          statusDiv.style.backgroundColor = 'rgba(244, 67, 54, 0.3)';
+          statusText.textContent = '⚠️ Redis disconnected - Using file storage backup';
+          alert('⚠️ Redis Connection Status:\n\nConnected: NO\n' + 
+            'Fallback: File Storage\n\n' + 
+            'Messages are being stored in file storage.\n\n' + 
+            'To connect Redis, check your REDIS_URL environment variable.\n' + 
+            'Expected URL: ' + data.redisUrl);
+        }
+      } catch (error) {
+        statusDiv.style.backgroundColor = 'rgba(244, 67, 54, 0.3)';
+        statusText.textContent = '❌ Failed to check Redis status';
+        alert(`❌ Error: ${error.message}`);
+      }
+    }
+
     async function manualSync() {
       const originalText = event.target.textContent;
       event.target.textContent = '⏳ Syncing...';
@@ -406,7 +443,7 @@
         const response = await fetch('/admin-sync', { method: 'POST' });
         const data = await response.json();
         
-        alert(`✅ Sync Complete!\n\nKV Messages: ${data.kvCount}\nFile Messages: ${data.fileCount}\nTotal Merged: ${data.mergedCount}`);
+        alert(`✅ Sync Complete!\n\nTotal Messages: ${data.totalMessages}\n\nAll messages backed up to both Redis and file storage!`);
         loadReplies(); // Reload after sync
       } catch (error) {
         alert(`❌ Sync Failed: ${error.message}`);
@@ -422,11 +459,10 @@
         const status = await response.json();
         
         alert(`📊 Storage Status:\n\n` +
-          `KV Database: ${status.kvMessages} messages\n` +
-          `File Storage: ${status.fileMessages} messages\n` +
-          `Total Unique: ${status.totalUnique} messages\n\n` +
-          `KV Available: ${status.kvAvailable ? '✅' : '❌'}\n` +
-          `File Available: ${status.fileAvailable ? '✅' : '❌'}`);
+          `Total Messages: ${status.totalMessages}\n` +
+          `Storage Type: ${status.storageType}\n` +
+          `Redis Connected: ${status.redisConnected ? '✅ YES' : '❌ NO'}\n\n` +
+          `Last Update: ${new Date(status.lastUpdate).toLocaleTimeString()}`);
       } catch (error) {
         alert(`❌ Failed to check status: ${error.message}`);
       }
@@ -483,15 +519,16 @@
 
     // Load replies on page load
     loadReplies();
+    checkRedis(); // Check Redis status on load
 
     // Auto-refresh every 10 seconds
     setInterval(loadReplies, 10000);
 
-    // Auto-sync data every 5 minutes to prevent loss
+    // Auto-sync data every 5 minutes to ensure persistence
     setInterval(async () => {
       try {
         await fetch('/admin-sync', { method: 'POST' });
-        console.log('✅ Background sync completed');
+        console.log('✅ Background sync to Redis completed');
       } catch (err) {
         console.warn('⚠️ Background sync failed:', err);
       }

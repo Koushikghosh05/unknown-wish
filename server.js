@@ -2,6 +2,7 @@ import express from 'express';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import redis from 'redis';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -13,36 +14,123 @@ app.use(express.static('dist'));
 
 // Path to replies file
 const repliesFile = path.join(__dirname, 'replies.json');
-const tmpRepliesFile = '/tmp/replies.json';
 
-// Check if running on Vercel
+// Check environment
 const isVercel = !!process.env.VERCEL;
-let kv = null;
+const redisUrl = process.env.REDIS_URL;
 
-// Initialize Vercel KV if available
-if (isVercel) {
-  try {
-    const { kv: vercelKv } = await import('@vercel/kv');
-    kv = vercelKv;
-    console.log('✅ Vercel KV connected');
-  } catch (err) {
-    console.warn('⚠️  Vercel KV not available. Using temporary file storage.');
-  }
-}
+console.log(`\n🌍 Environment: ${isVercel ? 'Vercel' : 'Local'}`);
+console.log(`📍 Redis URL: ${redisUrl ? '✅ Configured' : '❌ Not set'}`);
 
-// Get the appropriate replies file path
-function getRepliesFilePath() {
-  if (isVercel) {
-    return tmpRepliesFile;
+// Redis client setup - works with Vercel Upstash Redis
+const redisClient = redis.createClient({
+  url: redisUrl || 'redis://localhost:6379',
+  socket: {
+    tls: redisUrl && redisUrl.startsWith('rediss') ? true : false, // TLS for Upstash
+    reconnectStrategy: (retries) => {
+      if (retries > 10) {
+        console.error('⚠️  Max Redis reconnection attempts reached');
+        return false;
+      }
+      console.log(`🔄 Redis reconnection attempt ${retries + 1}/10`);
+      return Math.min(retries * 100, 3000);
+    }
   }
-  return repliesFile;
-}
+});
+
+let redisConnected = false;
+
+// Connect to Redis
+redisClient.on('error', (err) => {
+  console.error('❌ Redis Error:', err.message);
+  redisConnected = false;
+});
+
+redisClient.on('connect', () => {
+  console.log('✅ Redis connected successfully');
+  redisConnected = true;
+});
+
+redisClient.on('reconnecting', () => {
+  console.log('🔄 Redis attempting to reconnect...');
+});
+
+// Connect to Redis
+await redisClient.connect().catch(err => {
+  console.error('❌ Could not connect to Redis:', err.message);
+  console.log('📁 Using file storage as fallback');
+  console.log(`💡 REDIS_URL env variable: ${redisUrl || 'NOT SET'}`);
+  redisConnected = false;
+});
 
 // Ensure replies file exists
 function ensureRepliesFile() {
-  const filePath = getRepliesFilePath();
-  if (!fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+  if (!fs.existsSync(repliesFile)) {
+    fs.writeFileSync(repliesFile, JSON.stringify([], null, 2));
+  }
+}
+
+// Get all replies from Redis or file
+async function getAllReplies() {
+  let replies = [];
+
+  // Try Redis first
+  if (redisConnected) {
+    try {
+      const data = await redisClient.get('replies');
+      if (data) {
+        replies = JSON.parse(data);
+        console.log(`✅ Retrieved ${replies.length} messages from Redis`);
+        return replies;
+      }
+    } catch (err) {
+      console.error('⚠️  Redis read error:', err);
+    }
+  }
+
+  // Fallback to file storage
+  try {
+    ensureRepliesFile();
+    const data = fs.readFileSync(repliesFile, 'utf8');
+    replies = JSON.parse(data);
+    console.log(`📁 Retrieved ${replies.length} messages from file storage`);
+    
+    // Sync file data to Redis if connected
+    if (redisConnected && replies.length > 0) {
+      try {
+        await redisClient.set('replies', JSON.stringify(replies));
+        console.log('🔄 Synced file data to Redis');
+      } catch (err) {
+        console.warn('⚠️  Could not sync to Redis:', err.message);
+      }
+    }
+    
+    return replies;
+  } catch (err) {
+    console.error('⚠️  File read error:', err);
+    return [];
+  }
+}
+
+// Save replies to both Redis and file
+async function saveReplies(replies) {
+  // Save to file
+  try {
+    ensureRepliesFile();
+    fs.writeFileSync(repliesFile, JSON.stringify(replies, null, 2));
+    console.log(`📁 Saved ${replies.length} messages to file`);
+  } catch (err) {
+    console.error('❌ File save error:', err);
+  }
+
+  // Save to Redis (no expiration - persistent!)
+  if (redisConnected) {
+    try {
+      await redisClient.set('replies', JSON.stringify(replies));
+      console.log(`✅ Saved ${replies.length} messages to Redis (persistent, no expiration)`);
+    } catch (err) {
+      console.error('❌ Redis save error:', err);
+    }
   }
 }
 
@@ -63,71 +151,23 @@ app.post('/submit-reply', async (req, res) => {
       timestamp: Date.now()
     };
 
-    let replies = [];
-    let kvReplies = [];
-    let fileReplies = [];
-
-    // Get existing replies from both sources
-    if (isVercel && kv) {
-      try {
-        const data = await kv.get('replies');
-        if (data) {
-          kvReplies = typeof data === 'string' ? JSON.parse(data) : data;
-        }
-      } catch (kvError) {
-        console.error('⚠️  KV read error:', kvError);
-      }
-    }
-
-    try {
-      ensureRepliesFile();
-      const filePath = getRepliesFilePath();
-      const data = fs.readFileSync(filePath, 'utf8');
-      fileReplies = JSON.parse(data);
-    } catch (fileError) {
-      console.error('⚠️  File read error:', fileError);
-    }
-
-    // Merge from both sources
-    const mergedMap = new Map();
-    [...kvReplies, ...fileReplies].forEach(reply => {
-      if (!mergedMap.has(reply.id)) {
-        mergedMap.set(reply.id, reply);
-      }
-    });
-    replies = Array.from(mergedMap.values());
-    
-    // Add new reply
+    // Get all existing replies
+    const replies = await getAllReplies();
     replies.push(newReply);
 
-    // Save to file storage
-    try {
-      const filePath = getRepliesFilePath();
-      fs.writeFileSync(filePath, JSON.stringify(replies, null, 2));
-      console.log(`✅ Reply saved to file storage (total: ${replies.length})`);
-    } catch (fileError) {
-      console.error('⚠️  File save error:', fileError);
-    }
-
-    // Save to KV storage
-    if (isVercel && kv) {
-      try {
-        await kv.set('replies', JSON.stringify(replies));
-        console.log(`✅ Reply synced to Vercel KV (total: ${replies.length})`);
-      } catch (kvError) {
-        console.error('⚠️  KV save error:', kvError);
-      }
-    }
+    // Save to both Redis and file
+    await saveReplies(replies);
 
     res.status(200).json({ 
       success: true, 
       message: 'Reply submitted successfully!',
       reply: newReply,
-      totalReplies: replies.length
+      totalReplies: replies.length,
+      redisConnected: redisConnected
     });
 
   } catch (error) {
-    console.error('Error saving reply:', error);
+    console.error('❌ Error saving reply:', error);
     res.status(500).json({ error: 'Failed to save reply' });
   }
 });
@@ -135,190 +175,82 @@ app.post('/submit-reply', async (req, res) => {
 // GET: Retrieve all replies
 app.get('/get-replies', async (req, res) => {
   try {
-    let kvReplies = [];
-    let fileReplies = [];
-
-    // Get data from Vercel KV
-    if (isVercel && kv) {
-      try {
-        const data = await kv.get('replies');
-        if (data) {
-          kvReplies = typeof data === 'string' ? JSON.parse(data) : data;
-        }
-        console.log(`✅ Retrieved ${kvReplies.length} messages from Vercel KV`);
-      } catch (kvError) {
-        console.error('⚠️  KV Error:', kvError);
-      }
-    }
-
-    // Get data from file storage as backup
-    try {
-      ensureRepliesFile();
-      const filePath = getRepliesFilePath();
-      const data = fs.readFileSync(filePath, 'utf8');
-      fileReplies = JSON.parse(data);
-      console.log(`✅ Retrieved ${fileReplies.length} messages from file storage`);
-    } catch (fileError) {
-      console.error('⚠️  File storage error:', fileError);
-    }
-
-    // Merge replies from both sources and remove duplicates
-    const mergedMap = new Map();
+    const replies = await getAllReplies();
     
-    [...kvReplies, ...fileReplies].forEach(reply => {
-      if (!mergedMap.has(reply.id)) {
-        mergedMap.set(reply.id, reply);
-      }
-    });
-
-    let replies = Array.from(mergedMap.values());
-    
-    // If merged result has more data, sync it back to both storages
-    if (replies.length > kvReplies.length || replies.length > fileReplies.length) {
-      console.log(`🔄 Syncing ${replies.length} total messages to both storages`);
-      
-      // Sync to file
-      try {
-        const filePath = getRepliesFilePath();
-        fs.writeFileSync(filePath, JSON.stringify(replies, null, 2));
-      } catch (err) {
-        console.error('⚠️  Failed to sync to file:', err);
-      }
-      
-      // Sync to KV
-      if (isVercel && kv) {
-        try {
-          await kv.set('replies', JSON.stringify(replies));
-        } catch (err) {
-          console.error('⚠️  Failed to sync to KV:', err);
-        }
-      }
-    }
-
     // Sort by most recent first
     replies.sort((a, b) => b.timestamp - a.timestamp);
 
-    res.status(200).json({ replies });
+    res.status(200).json({ 
+      replies,
+      redisConnected: redisConnected,
+      timestamp: new Date().toISOString()
+    });
   } catch (error) {
-    console.error('Error reading replies:', error);
-    res.status(500).json({ error: 'Failed to read replies', replies: [] });
+    console.error('❌ Error reading replies:', error);
+    res.status(500).json({ 
+      error: 'Failed to read replies', 
+      replies: [],
+      redisConnected: redisConnected
+    });
   }
 });
 
-// GET: Admin status and sync report
+// GET: Admin status
 app.get('/admin-status', async (req, res) => {
   try {
-    let kvReplies = [];
-    let fileReplies = [];
-
-    if (isVercel && kv) {
-      try {
-        const data = await kv.get('replies');
-        if (data) {
-          kvReplies = typeof data === 'string' ? JSON.parse(data) : data;
-        }
-      } catch (err) {
-        console.error('KV status check failed:', err);
-      }
-    }
-
-    try {
-      ensureRepliesFile();
-      const filePath = getRepliesFilePath();
-      const data = fs.readFileSync(filePath, 'utf8');
-      fileReplies = JSON.parse(data);
-    } catch (err) {
-      console.error('File status check failed:', err);
-    }
-
-    const mergedMap = new Map();
-    [...kvReplies, ...fileReplies].forEach(reply => {
-      if (!mergedMap.has(reply.id)) {
-        mergedMap.set(reply.id, reply);
-      }
-    });
-    const totalUnique = mergedMap.size;
-
+    const replies = await getAllReplies();
+    
     res.status(200).json({
-      kvMessages: kvReplies.length,
-      fileMessages: fileReplies.length,
-      totalUnique: totalUnique,
-      kvAvailable: !!kv,
-      fileAvailable: fileReplies.length > 0,
-      timestamp: new Date().toISOString()
+      totalMessages: replies.length,
+      redisConnected: redisConnected,
+      storageType: redisConnected ? 'Redis (Primary) + File (Backup)' : 'File Only',
+      lastUpdate: new Date().toISOString()
     });
   } catch (error) {
     res.status(500).json({ error: 'Failed to get status' });
   }
 });
 
-// POST: Manually sync/restore all messages
+// POST: Force sync messages to both storages
 app.post('/admin-sync', async (req, res) => {
   try {
-    let kvReplies = [];
-    let fileReplies = [];
-
-    // Get from KV
-    if (isVercel && kv) {
-      try {
-        const data = await kv.get('replies');
-        if (data) {
-          kvReplies = typeof data === 'string' ? JSON.parse(data) : data;
-        }
-      } catch (err) {
-        console.error('KV sync error:', err);
-      }
-    }
-
-    // Get from file
-    try {
-      ensureRepliesFile();
-      const filePath = getRepliesFilePath();
-      const data = fs.readFileSync(filePath, 'utf8');
-      fileReplies = JSON.parse(data);
-    } catch (err) {
-      console.error('File sync error:', err);
-    }
-
-    // Merge
-    const mergedMap = new Map();
-    [...kvReplies, ...fileReplies].forEach(reply => {
-      if (!mergedMap.has(reply.id)) {
-        mergedMap.set(reply.id, reply);
-      }
-    });
-    const mergedReplies = Array.from(mergedMap.values())
-      .sort((a, b) => b.timestamp - a.timestamp);
-
-    // Sync merged data to file
-    try {
-      const filePath = getRepliesFilePath();
-      fs.writeFileSync(filePath, JSON.stringify(mergedReplies, null, 2));
-      console.log(`✅ Synced ${mergedReplies.length} messages to file`);
-    } catch (err) {
-      console.error('File sync write error:', err);
-    }
-
-    // Sync to KV
-    if (isVercel && kv) {
-      try {
-        await kv.set('replies', JSON.stringify(mergedReplies));
-        console.log(`✅ Synced ${mergedReplies.length} messages to KV`);
-      } catch (err) {
-        console.error('KV sync write error:', err);
-      }
-    }
-
+    const replies = await getAllReplies();
+    await saveReplies(replies);
+    
     res.status(200).json({
       success: true,
-      message: `Synced ${mergedReplies.length} total messages`,
-      kvCount: kvReplies.length,
-      fileCount: fileReplies.length,
-      mergedCount: mergedReplies.length
+      message: `Synced ${replies.length} messages to Redis and file storage`,
+      totalMessages: replies.length,
+      redisConnected: redisConnected
     });
   } catch (error) {
-    console.error('Sync error:', error);
+    console.error('❌ Sync error:', error);
     res.status(500).json({ error: 'Sync failed' });
+  }
+});
+
+// GET: Verify Redis connection
+app.get('/check-redis', async (req, res) => {
+  if (!redisConnected) {
+    return res.status(503).json({ 
+      connected: false, 
+      message: 'Redis not connected. Using file storage as fallback.',
+      redisUrl: process.env.REDIS_URL || 'redis://localhost:6379 (default)'
+    });
+  }
+
+  try {
+    await redisClient.ping();
+    res.status(200).json({ 
+      connected: true, 
+      message: 'Redis is healthy!',
+      redisUrl: process.env.REDIS_URL || 'redis://localhost:6379 (default)'
+    });
+  } catch (err) {
+    res.status(503).json({ 
+      connected: false, 
+      error: err.message 
+    });
   }
 });
 
@@ -333,8 +265,32 @@ app.get('/admin.html', (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`🎉 Server running at http://localhost:${PORT}`);
+const server = app.listen(PORT, () => {
+  console.log(`\n🎉 Server running at http://localhost:${PORT}`);
   console.log(`📝 Reply page: http://localhost:${PORT}/reply.html`);
   console.log(`👑 Admin panel: http://localhost:${PORT}/admin.html`);
+  console.log(`🔍 Check Redis: http://localhost:${PORT}/check-redis\n`);
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n\n🛑 Shutting down gracefully...');
+  
+  // Close server
+  server.close(() => {
+    console.log('✅ Server closed');
+  });
+
+  // Disconnect Redis
+  if (redisConnected) {
+    try {
+      await redisClient.quit();
+      console.log('✅ Redis disconnected');
+    } catch (err) {
+      console.error('⚠️  Error disconnecting Redis:', err);
+      await redisClient.disconnect();
+    }
+  }
+
+  process.exit(0);
 });
