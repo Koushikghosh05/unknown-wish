@@ -27,6 +27,18 @@
       "dest": "server.js"
     },
     {
+      "src": "/check-redis",
+      "dest": "server.js"
+    },
+    {
+      "src": "/admin-status",
+      "dest": "server.js"
+    },
+    {
+      "src": "/admin-sync",
+      "dest": "server.js"
+    },
+    {
       "src": "/(.*)",
       "dest": "dist/$1"
     }
